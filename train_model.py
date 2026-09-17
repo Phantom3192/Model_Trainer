@@ -337,7 +337,7 @@ class Database:
         
         if TURSO_URL:
             try:
-                import libsql_experimental as libsql
+                import libsql
                 self._conn = libsql.connect(TURSO_URL, auth_token=TURSO_AUTH_TOKEN)
                 self.use_turso = True
                 log.info(f"✅ Connected to Turso database")
