@@ -188,10 +188,19 @@ TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))  # Increased for streaming
 STREAM_BATCH_SIZE = int(os.getenv("STREAM_BATCH_SIZE", "20"))  # Images per stream batch - kept small so only one small chunk is ever in memory at a time
-EPOCHS = int(os.getenv("EPOCHS", "20"))
-LEARNING_RATE = float(os.getenv("LEARNING_RATE", "1e-4"))
-EARLY_STOP_ACC = float(os.getenv("EARLY_STOP_ACC", "95.0"))  # stop once train acc hits this %
-EARLY_STOP_PATIENCE = int(os.getenv("EARLY_STOP_PATIENCE", "3"))  # stop if val acc doesn't improve for N epochs
+# Head training (projection + classifier on cached frozen-backbone features).
+# Epochs here take seconds, not hours, so these defaults are much larger than
+# the old per-image-streaming EPOCHS/LEARNING_RATE ones.
+HEAD_EPOCHS = int(os.getenv("HEAD_EPOCHS", "80"))
+HEAD_LR = float(os.getenv("HEAD_LR", "1e-3"))
+HEAD_BATCH = int(os.getenv("HEAD_BATCH", "256"))
+HEAD_WEIGHT_DECAY = float(os.getenv("HEAD_WEIGHT_DECAY", "1e-2"))
+HEAD_FEATURE_DROPOUT = float(os.getenv("HEAD_FEATURE_DROPOUT", "0.2"))
+HEAD_PATIENCE = int(os.getenv("HEAD_PATIENCE", "15"))  # stop if val retrieval acc doesn't improve for N epochs
+# The features already in the DB were written by an untrained/inconsistent
+# projection (and every epoch appended more), so they can't be compared with
+# embeddings from the new model. Default: wipe and rewrite them at the end.
+REPLACE_DB_FEATURES = os.getenv("REPLACE_DB_FEATURES", "true").lower() == "true"
 DATASET_NAME = os.getenv("DATASET_NAME", "SpreadSheets/Poketwo-Spawn-Images")
 MODEL_OUTPUT = os.getenv("MODEL_OUTPUT", "models/pokemon_classifier.pt")
 DB_PATH = os.getenv("DB_PATH", "pokemon.db")
@@ -433,6 +442,69 @@ class Database:
             except Exception:
                 pass
     
+    def clear_features(self):
+        """Removes every stored feature vector + species count."""
+        cursor = self._conn.cursor()
+        try:
+            cursor.execute("DELETE FROM pokemon_features")
+            cursor.execute("DELETE FROM species_info")
+            self._conn.commit()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+    def bulk_add_features(self, species_to_features: Dict[str, List[np.ndarray]],
+                          rows_per_stmt: int = 50, stmts_per_commit: int = 10):
+        """
+        Fast bulk insert: multi-row INSERT statements (50 rows each) instead of
+        one round-trip per row + a COUNT(*) per species. Over a remote Turso
+        connection the per-row version costs seconds per image.
+        Assumes the table was just cleared (variant names restart at 1 and
+        species_info.count is set, not incremented).
+        """
+        rows = []
+        for species, feats in species_to_features.items():
+            for i, feat in enumerate(feats):
+                # 6 decimals is plenty for cosine similarity and ~halves the payload
+                rows.append((species, f"{species}_{i + 1}", json.dumps(np.round(feat, 6).tolist())))
+
+        cursor = self._conn.cursor()
+        try:
+            n_stmts = 0
+            for i in range(0, len(rows), rows_per_stmt):
+                chunk = rows[i:i + rows_per_stmt]
+                placeholders = ",".join(["(?, ?, ?, strftime('%s', 'now'))"] * len(chunk))
+                params = tuple(v for row in chunk for v in row)
+                cursor.execute(
+                    "INSERT OR REPLACE INTO pokemon_features "
+                    "(species, variant_name, feature_vector, created_at) VALUES " + placeholders,
+                    params,
+                )
+                n_stmts += 1
+                if n_stmts % stmts_per_commit == 0:
+                    self._conn.commit()
+            self._conn.commit()
+
+            items = [(sp, len(f)) for sp, f in species_to_features.items() if f]
+            for i in range(0, len(items), 100):
+                chunk = items[i:i + 100]
+                placeholders = ",".join(["(?, ?, strftime('%s', 'now'))"] * len(chunk))
+                params = tuple(v for row in chunk for v in row)
+                cursor.execute(
+                    "INSERT INTO species_info (species, count, last_updated) VALUES " + placeholders +
+                    " ON CONFLICT(species) DO UPDATE SET count = excluded.count, "
+                    "last_updated = excluded.last_updated",
+                    params,
+                )
+            self._conn.commit()
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
     def get_stats(self) -> Dict[str, Any]:
         cursor = self._conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM pokemon_features")
@@ -650,16 +722,31 @@ class PokemonFeatureExtractor(nn.Module):
             return np.zeros((len(images), 256))
 
 
+class CosineHead(nn.Module):
+    """
+    Cosine-softmax classifier. The embeddings are L2-normalised (unit norm),
+    and the old Linear->ReLU->Dropout->Linear head on unit-norm inputs
+    produced near-zero logits, so the loss sat at ln(num_classes) for
+    ages. Scaling the cosine similarities fixes that and trains exactly the
+    geometry the bot uses at lookup time (cosine similarity to stored
+    features). Only the feature extractor is saved/deployed, so this head
+    never has to match anything outside training.
+    """
+    def __init__(self, in_dim: int, num_classes: int, scale: float = 30.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_classes, in_dim))
+        nn.init.xavier_uniform_(self.weight)
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * F.linear(F.normalize(x, dim=1), F.normalize(self.weight, dim=1))
+
+
 class PokemonClassifier(nn.Module):
     def __init__(self, num_species: int):
         super().__init__()
         self.feature_extractor = PokemonFeatureExtractor()
-        self.classifier = nn.Sequential(
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_species)
-        )
+        self.classifier = CosineHead(256, num_species)
     
     def forward_batch(self, images: List[Image.Image], grad: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.feature_extractor.extract_batch(images, grad=grad)
@@ -1139,70 +1226,180 @@ class StreamingPokemonDataset(IterableDataset):
 
 # ============ STREAMING TRAINER ============
 
-def store_chunk_features_to_db(features_tensor, batch_labels, idx_to_species: Dict[int, str], db):
+@torch.no_grad()
+def _backbone_features(fe: "PokemonFeatureExtractor", batch_u8: torch.Tensor) -> torch.Tensor:
     """
-    Saves the features for a chunk that was JUST trained on, straight to
-    the DB, using the features already computed during that chunk's
-    forward pass (no extra model call needed). Called right after every
-    small chunk so results are persisted and the chunk can be dropped
-    from memory immediately - nothing waits until end-of-epoch.
+    uint8 (B,3,224,224) -> frozen ShuffleNet features (B,1024).
+    Same math as PokemonFeatureExtractor.extract_batch (÷255 -> Normalize ->
+    backbone), minus the pointless tensor->PIL->tensor round trip.
     """
-    feature_buffer: Dict[str, List[np.ndarray]] = {}
-    feats_np = features_tensor.detach().cpu().numpy()
-    labels_list = batch_labels.detach().cpu().tolist()
-    for feat, lbl in zip(feats_np, labels_list):
-        if not np.all(feat == 0):
-            species = idx_to_species.get(lbl)
-            if species:
-                feature_buffer.setdefault(species, []).append(feat)
-    # One cursor, one commit for the whole chunk - see add_pokemon_features_batch.
-    db.add_pokemon_features_batch(feature_buffer)
+    x = fe.normalize(batch_u8.float().div_(255.0))
+    return fe.backbone(x)
 
 
-def store_features_to_db(model, dataset, db, label="checkpoint"):
+def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
+                       total_hint: int = 0, tag: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Batched feature extraction + incremental DB write, using extract_batch
-    (not one-image-at-a-time) so it's fast even at thousands of images.
-    Called after every improved checkpoint, not just once at the very end,
-    so a crash mid-training doesn't lose everything collected so far.
+    One pass over `items` (any iterable of (uint8 image tensor, label)),
+    returning (features [N,1024], labels [N]).
+
+    The backbone is frozen and the cached images are already augmented, so
+    its output for a given image never changes between epochs - computing it
+    once and training the head on the cached vectors is mathematically the
+    same as the old per-epoch forward pass, ~1000x cheaper, and lets us
+    shuffle freely (see train_head).
     """
-    log.info(f"\n💾 Storing features to database ({label})...")
-    t_start = time.time()
-    
-    image_buffer = []
-    label_buffer = []
-    feature_buffer: Dict[str, List[np.ndarray]] = {}
-    count = 0
-    
-    def flush_batch():
-        nonlocal count
-        if not image_buffer:
+    feats: List[torch.Tensor] = []
+    labels: List[int] = []
+    buf_i: List[torch.Tensor] = []
+    buf_l: List[int] = []
+    n = 0
+    n_flush = 0
+    t0 = time.time()
+
+    def flush():
+        nonlocal n, n_flush
+        if not buf_i:
             return
-        pil_imgs = [transforms.ToPILImage()(img.cpu()) for img in image_buffer]
-        features = model.feature_extractor.extract_batch(pil_imgs)
-        for feat, lbl in zip(features, label_buffer):
-            if not np.all(feat == 0):
-                species = dataset.idx_to_species[lbl]
-                feature_buffer.setdefault(species, []).append(feat)
-                count += 1
-        image_buffer.clear()
-        label_buffer.clear()
-    
-    for img, label in dataset:
-        image_buffer.append(img)
-        label_buffer.append(label)
-        if len(image_buffer) >= 50:
-            flush_batch()
-            db.add_pokemon_features_batch(feature_buffer)
-            feature_buffer = {}
+        feats.append(_backbone_features(fe, torch.stack(buf_i)).cpu())
+        labels.extend(buf_l)
+        n += len(buf_i)
+        n_flush += 1
+        buf_i.clear()
+        buf_l.clear()
+        if n_flush % 25 == 0:
+            of = f"/{total_hint}" if total_hint else ""
+            log.info(f"   🧊 [{tag}] {n}{of} images embedded ({n / max(time.time() - t0, 1e-6):.0f} img/s)")
+        if n_flush % 100 == 0:
             gc.collect()
             _trim_memory()
-    
-    flush_batch()
-    db.add_pokemon_features_batch(feature_buffer)
-    
-    elapsed = time.time() - t_start
-    log.info(f"   ✅ Stored {count} features in {elapsed:.0f}s")
+            log_memory(f"{tag} feature pass")
+
+    for img, label in items:
+        buf_i.append(img)
+        buf_l.append(int(label))
+        if len(buf_i) >= batch_size:
+            flush()
+    flush()
+
+    if not feats:
+        return torch.empty(0, 1024), torch.empty(0, dtype=torch.long)
+    return torch.cat(feats), torch.tensor(labels, dtype=torch.long)
+
+
+@torch.no_grad()
+def _embed(fe: "PokemonFeatureExtractor", X: torch.Tensor, bs: int = 2048) -> torch.Tensor:
+    out = [F.normalize(fe.projection(X[i:i + bs]), p=2, dim=1) for i in range(0, X.size(0), bs)]
+    return torch.cat(out) if out else torch.empty(0, 256)
+
+
+@torch.no_grad()
+def _evaluate(model: "PokemonClassifier", Etr, ytr, Xv, yv) -> Tuple[float, float]:
+    """
+    Returns (classifier top-1 %, retrieval 1-NN %) on the held-out set.
+    Retrieval = nearest stored training embedding by cosine similarity, which
+    is how the bot actually uses the DB, so that's what we select on.
+    """
+    if Xv.size(0) == 0:
+        return 0.0, 0.0
+    Ev = _embed(model.feature_extractor, Xv)
+    cls_acc = (model.classifier(Ev).argmax(1) == yv).float().mean().item() * 100
+    correct = 0
+    for i in range(0, Ev.size(0), 512):
+        sims = Ev[i:i + 512] @ Etr.T
+        correct += (ytr[sims.argmax(1)] == yv[i:i + 512]).sum().item()
+    return cls_acc, 100 * correct / Ev.size(0)
+
+
+def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
+    """
+    Trains projection + classifier on cached backbone features with proper
+    shuffling. The old loop fed the head images in the cache's on-disk order
+    (grouped species by species), so every 20-image batch was ~1 class and
+    the head could only chase "whatever class is current" - loss stayed at
+    ln(1119) ≈ 7.0 forever no matter what the model or LR was.
+    Leaves the BEST epoch's weights loaded in `model`; returns its val
+    retrieval accuracy.
+    """
+    fe = model.feature_extractor
+    params = list(fe.projection.parameters()) + list(model.classifier.parameters())
+    optimizer = optim.AdamW(params, lr=HEAD_LR, weight_decay=HEAD_WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(HEAD_EPOCHS, 1))
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    N = Xtr.size(0)
+    has_val = Xv.size(0) > 0
+    if not has_val:
+        log.warning("   ⚠️ No held-out validation set - training all epochs and keeping the last one")
+
+    best_acc, best_epoch, best_state, stale = -1.0, 0, None, 0
+
+    for epoch in range(HEAD_EPOCHS):
+        t0 = time.time()
+        # projection + classifier have no BatchNorm; the (frozen) backbone
+        # never runs here, so nothing can drift.
+        fe.projection.train()
+        model.classifier.train()
+
+        perm = torch.randperm(N)
+        loss_sum, correct = 0.0, 0
+        for i in range(0, N, HEAD_BATCH):
+            idx = perm[i:i + HEAD_BATCH]
+            xb = F.dropout(Xtr[idx], p=HEAD_FEATURE_DROPOUT, training=True)
+            yb = ytr[idx]
+            emb = F.normalize(fe.projection(xb), p=2, dim=1)
+            logits = model.classifier(emb)
+            loss = criterion(logits, yb)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            loss_sum += loss.item() * yb.size(0)
+            correct += (logits.argmax(1) == yb).sum().item()
+        scheduler.step()
+
+        fe.projection.eval()
+        model.classifier.eval()
+        Etr = _embed(fe, Xtr)
+        cls_acc, ret_acc = _evaluate(model, Etr, ytr, Xv, yv)
+        log.info(f"   📊 Epoch {epoch + 1}/{HEAD_EPOCHS}: loss {loss_sum / N:.3f}, "
+                 f"train acc {100 * correct / N:.1f}%, val acc {cls_acc:.1f}%, "
+                 f"val retrieval {ret_acc:.1f}% ({time.time() - t0:.1f}s)")
+
+        score = ret_acc if has_val else float(epoch)
+        if score > best_acc:
+            best_acc, best_epoch, stale = score, epoch + 1, 0
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        else:
+            stale += 1
+            if has_val and stale >= HEAD_PATIENCE:
+                log.info(f"   ⏸️ No val improvement in {HEAD_PATIENCE} epochs "
+                         f"(best: {best_acc:.1f}% at epoch {best_epoch}), stopping")
+                break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.eval()
+    return best_acc if has_val else 0.0
+
+
+def write_features_to_db(model: "PokemonClassifier", Xtr, ytr, dataset, db):
+    """
+    Re-embeds every training image with the FINAL (best) model and writes
+    the vectors to the DB, so the DB always matches the saved model.
+    """
+    log.info("\n💾 Writing features to database...")
+    t0 = time.time()
+    E = _embed(model.feature_extractor, Xtr).numpy()
+    per_species: Dict[str, List[np.ndarray]] = {}
+    for emb, lbl in zip(E, ytr.tolist()):
+        species = dataset.idx_to_species.get(lbl)
+        if species:
+            per_species.setdefault(species, []).append(emb)
+    if REPLACE_DB_FEATURES:
+        log.info("   🧹 Clearing old features first (REPLACE_DB_FEATURES=true)")
+        db.clear_features()
+    db.bulk_add_features(per_species)
+    log.info(f"   ✅ Stored {len(E)} features for {len(per_species)} species in {time.time() - t0:.0f}s")
 
 
 def _detect_container_memory_limit_mb() -> Optional[float]:
@@ -1287,9 +1484,9 @@ def stream_train():
     log.info("")
     log.info("🚀 Pokémon AI Trainer - STREAMING MODE")
     log.info("=" * 60)
-    log.info("   ✅ Processes images in batches")
-    log.info("   ✅ Clears memory after each batch")
-    log.info("   ✅ Saves to database incrementally")
+    log.info("   ✅ Streams/caches images once, embeds with the frozen backbone")
+    log.info("   ✅ Trains the head on shuffled cached features")
+    log.info("   ✅ Writes features matching the final model to the database")
     log.info("=" * 60)
     
     if HF_TOKEN:
@@ -1321,394 +1518,72 @@ def stream_train():
     log.info("\n🧠 Initializing model...")
     model = PokemonClassifier(num_species=num_species)
     model.to(DEVICE)
-    # Backbone (shufflenet) stays frozen - extract_batch always runs it under
-    # torch.no_grad() regardless of this train()/eval() call. `projection`
-    # has no BatchNorm/Dropout so train()/eval() doesn't change its math -
-    # this call just needs to not be .eval() so nothing here is confusing
-    # later. What actually makes projection trainable is passing its
-    # parameters to the optimizer below + forward_batch(..., grad=True).
-    model.feature_extractor.train()
-    
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(
-        list(model.classifier.parameters()) + list(model.feature_extractor.projection.parameters()),
-        lr=LEARNING_RATE, weight_decay=1e-4
-    )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    
-    log.info(f"\n🎯 Training for {EPOCHS} epochs...")
-    log.info(f"   Species: {num_species}")
-    log.info(f"   Batch size: {BATCH_SIZE}")
-    log.info(f"   Stream batch: {STREAM_BATCH_SIZE} images per batch")
-    log.info(f"   Learning rate: {LEARNING_RATE}")
-    log.info(f"   Early-stop target: {EARLY_STOP_ACC}% train acc, "
-             f"or {EARLY_STOP_PATIENCE} epochs without val improvement")
+    # The ShuffleNet backbone is FROZEN, so it must stay in eval() for the
+    # whole run. The old code called feature_extractor.train(), which put the
+    # backbone's BatchNorm layers in TRAIN mode: every (single-species)
+    # batch was normalised with its own statistics and overwrote the
+    # pretrained running mean/var - so the features drifted, and the saved
+    # model file contained corrupted BN buffers. Nothing below calls .train()
+    # on the backbone; train_head only toggles projection/classifier.
+    model.eval()
+    for p in model.feature_extractor.backbone.parameters():
+        p.requires_grad_(False)
+
+    # ============ PHASE 1: FROZEN-BACKBONE FEATURES (one pass) ============
+    log.info("\n🧊 Phase 1/3: embedding every image once with the frozen backbone...")
+    t0 = time.time()
+    fe = model.feature_extractor
+    total_hint = num_species * max(MAX_IMAGES_PER_SPECIES - VAL_IMAGES_PER_SPECIES, 0)
+    # PrefetchIterator overlaps Hugging Face streaming / disk reads with compute.
+    Xtr, ytr = build_feature_bank(PrefetchIterator(dataset, maxsize=STREAM_BATCH_SIZE * 2),
+                                  fe, STREAM_BATCH_SIZE, total_hint=total_hint, tag="train")
+    # The held-out set is only complete once the pass above has finished.
+    Xv, yv = build_feature_bank(dataset.get_val_set(), fe, STREAM_BATCH_SIZE, tag="val")
+    gc.collect()
+    _trim_memory()
+    log.info(f"   ✅ {Xtr.size(0)} train + {Xv.size(0)} val images embedded in {time.time() - t0:.0f}s")
+    log_memory("after feature pass")
+
+    if Xtr.size(0) == 0:
+        log.error("❌ No training images were collected! Exiting.")
+        db.close()
+        return
+    seen = int(ytr.unique().numel())
+    if seen < num_species:
+        log.warning(f"   ⚠️ Only {seen}/{num_species} species have training images")
+
+    # ============ PHASE 2: TRAIN PROJECTION + CLASSIFIER ============
+    log.info(f"\n🎯 Phase 2/3: training head ({Xtr.size(0)} samples, {num_species} species, "
+             f"{HEAD_EPOCHS} epochs max, lr {HEAD_LR}, batch {HEAD_BATCH})")
     log.info("-" * 60)
-    
-    best_val_acc = 0.0
-    epochs_without_improvement = 0
-    stop_training = False
-    start_epoch = 0
+    t0 = time.time()
+    best_acc = train_head(model, Xtr, ytr, Xv, yv)
+    log.info("-" * 60)
+    log.info(f"   ✅ Head trained in {time.time() - t0:.0f}s (best val retrieval acc: {best_acc:.1f}%)")
 
-    # ============ RESUME FROM CHECKPOINT IF ONE EXISTS ============
-    # Stored in the DB (Turso), not local disk - see Database.save_checkpoint_blob
-    # for why: Railway's local container disk doesn't survive restarts here,
-    # but the DB provably does (Existing species/features carry over every
-    # time).
-    checkpoint_blob = db.load_checkpoint_blob()
-    if checkpoint_blob:
-        try:
-            log.info(f"\n💾 Found checkpoint in DB, resuming training...")
-            checkpoint = torch.load(io.BytesIO(checkpoint_blob), map_location=DEVICE, weights_only=False)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            # A mid-epoch checkpoint (is_epoch_complete=False) means this
-            # epoch's data pass never finished - re-run this SAME epoch
-            # number (its weights are already partially trained, just not
-            # its exact position in the data stream) instead of skipping to
-            # the next one and silently dropping the rest of this epoch's
-            # data forever.
-            if checkpoint.get("is_epoch_complete", True):
-                start_epoch = checkpoint["epoch"] + 1
-            else:
-                start_epoch = checkpoint["epoch"]
-            best_val_acc = checkpoint.get("best_val_acc", 0.0)
-            epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
-            log.info(f"   ✅ Resuming at epoch {start_epoch + 1}/{EPOCHS} "
-                     f"(best val acc so far: {best_val_acc:.1f}%)")
-        except Exception as e:
-            log.exception(f"   ❌ Failed to load checkpoint ({e}), starting fresh instead")
-            start_epoch = 0
-            best_val_acc = 0.0
-            epochs_without_improvement = 0
-    else:
-        log.info(f"\n💾 No checkpoint found in DB, starting fresh")
+    os.makedirs(os.path.dirname(MODEL_OUTPUT) or ".", exist_ok=True)
+    torch.save(model.feature_extractor.state_dict(), MODEL_OUTPUT)
+    log.info(f"   ✅ Saved model to {MODEL_OUTPUT}")
 
-    if start_epoch >= EPOCHS:
-        log.info(f"   ℹ️ Checkpoint already completed all {EPOCHS} epochs - nothing to resume")
+    # ============ PHASE 3: WRITE FEATURES TO DB ============
+    log.info("\n🗄️ Phase 3/3: database")
+    write_features_to_db(model, Xtr, ytr, dataset, db)
 
-    # Config for periodic mid-epoch checkpointing - see note below on why
-    # end-of-epoch-only checkpointing wasn't enough.
-    CHECKPOINT_EVERY_N_BATCHES = int(os.getenv("CHECKPOINT_EVERY_N_BATCHES", "20"))
-    last_emergency_checkpoint_batch = [-999]  # list so the batch loop can mutate it in place
-
-    def _save_checkpoint(epoch_idx: int, is_epoch_complete: bool):
-        """
-        BUG FIXED: checkpointing used to happen only at the END of a
-        completed epoch. With ~28,625 images to stream per epoch on this
-        dataset, epoch 1 alone can take many hours - if the process gets
-        killed (OOM, redeploy, crash) before finishing even ONE epoch,
-        there was NO checkpoint yet to resume from at all, so a restart
-        always retrained from random weights regardless of how far batch_count
-        had gotten. Now this also gets called periodically mid-epoch
-        (every CHECKPOINT_EVERY_N_BATCHES batches), tagged
-        is_epoch_complete=False, so a mid-epoch crash still has recent
-        weights to resume from - only the exact batch position within the
-        epoch's data stream is lost, not the learning itself.
-        """
-        try:
-            buf = io.BytesIO()
-            torch.save({
-                "epoch": epoch_idx,
-                "is_epoch_complete": is_epoch_complete,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "best_val_acc": best_val_acc,
-                "epochs_without_improvement": epochs_without_improvement,
-            }, buf)
-            db.save_checkpoint_blob(buf.getvalue())
-            tag = "epoch complete" if is_epoch_complete else "mid-epoch"
-            log.info(f"   💾 Checkpoint saved to DB ({tag}, epoch {epoch_idx+1}/{EPOCHS}, "
-                     f"{len(buf.getvalue()) / 1024:.0f} KB)")
-        except Exception as e:
-            # log.exception (not log.warning(str(e))) so the full traceback
-            # actually shows up in the logs - a silent/vague failure here
-            # was the likely reason checkpoints appeared to save but a
-            # restart still found nothing to resume from.
-            log.exception(f"   ❌ Failed to save checkpoint (epoch {epoch_idx+1}): {e}")
-
-    for epoch in range(start_epoch, EPOCHS):
-        log.info(f"\n📊 Epoch {epoch+1}/{EPOCHS}")
-        
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        batch_count = 0
-        
-        # Stream images
-        image_buffer = []
-        label_buffer = []
-        
-        for img, label in PrefetchIterator(dataset, maxsize=STREAM_BATCH_SIZE * 2):
-            image_buffer.append(img)
-            label_buffer.append(label)
-            
-            # When buffer reaches STREAM_BATCH_SIZE, process it
-            if len(image_buffer) >= STREAM_BATCH_SIZE:
-                # Create a mini-batch from buffer
-                batch_imgs = torch.stack(image_buffer)
-                batch_labels = torch.tensor(label_buffer)
-                
-                # Move to device
-                batch_imgs = batch_imgs.to(DEVICE)
-                batch_labels = batch_labels.to(DEVICE)
-                
-                # Forward pass
-                optimizer.zero_grad()
-                
-                # Convert to PIL for feature extraction. Cached tensors are
-                # raw uint8 (see StreamingPokemonDataset.transform) so no
-                # un-normalize step is needed - ToPILImage handles uint8
-                # CHW tensors directly.
-                pil_imgs = []
-                for i in range(batch_imgs.size(0)):
-                    try:
-                        pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
-                        if pil_img.size[0] > 10 and pil_img.size[1] > 10:
-                            pil_imgs.append(pil_img)
-                    except Exception:
-                        continue
-                
-                if not pil_imgs:
-                    # Clear buffer and continue
-                    image_buffer = []
-                    label_buffer = []
-                    continue
-                
-                features, logits = None, None
-                try:
-                    features, logits = model.forward_batch(pil_imgs, grad=True)
-                    features = features.to(DEVICE)
-                    logits = logits.to(DEVICE)
-                    
-                    loss = criterion(logits, batch_labels[:len(pil_imgs)])
-                    loss.backward()
-                    optimizer.step()
-                    
-                    train_loss += loss.item() * batch_labels[:len(pil_imgs)].size(0)
-                    _, predicted = torch.max(logits, 1)
-                    train_total += batch_labels[:len(pil_imgs)].size(0)
-                    train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-                    batch_count += 1
-                    
-                    # Save this chunk's results to the DB right away, then
-                    # it's safe to drop from memory below - nothing about
-                    # this chunk needs to be revisited later.
-                    store_chunk_features_to_db(features, batch_labels[:len(pil_imgs)],
-                                                dataset.idx_to_species, db)
-                    
-                    # Progress update (every batch — cheap now that images are cached)
-                    acc = 100 * train_correct / train_total if train_total > 0 else 0
-                    log.info(f"   📊 Batch {batch_count}: Loss: {train_loss/train_total:.3f}, Acc: {acc:.1f}%")
-                    
-                    # Periodic mid-epoch checkpoint - see _save_checkpoint's
-                    # docstring for why end-of-epoch-only wasn't enough.
-                    if batch_count % CHECKPOINT_EVERY_N_BATCHES == 0:
-                        _save_checkpoint(epoch, is_epoch_complete=False)
-                    
-                    # Stop this epoch early once training accuracy hits the
-                    # target — no point grinding through remaining batches.
-                    # Require a few batches first so one lucky batch doesn't
-                    # trigger a false stop.
-                    if batch_count >= 3 and acc >= EARLY_STOP_ACC:
-                        log.info(f"   🎯 Reached target accuracy ({acc:.1f}% >= "
-                                 f"{EARLY_STOP_ACC}%), moving on early")
-                        del batch_imgs, batch_labels, pil_imgs
-                        gc.collect()
-                        _trim_memory()
-                        break
-                    
-                except Exception as e:
-                    log.warning(f"   ⚠️ Batch failed: {e}")
-                
-                # CLEAR MEMORY!
-                del batch_imgs
-                del batch_labels
-                del pil_imgs
-                del features, logits
-                torch.cuda.empty_cache() if torch.cuda.is_available() else None
-                gc.collect()
-                _trim_memory()
-                log_memory(f"batch {batch_count}")
-                
-                # Proactive safety net: if current usage is creeping toward
-                # the container's actual limit, get a fresh checkpoint out
-                # NOW rather than waiting for the next scheduled save - a
-                # kernel OOM kill is a hard SIGKILL with zero warning, so
-                # whatever checkpoint existed a few batches ago is all a
-                # restart will have. This can't prevent the kill itself,
-                # only minimize how much progress it costs.
-                if container_limit_mb is not None:
-                    current_rss = _get_current_rss_mb()
-                    if (current_rss is not None
-                            and current_rss > container_limit_mb * 0.85
-                            and batch_count - last_emergency_checkpoint_batch[0] >= 5):
-                        log.warning(f"   🚨 Current RSS ({current_rss:.0f} MB) is above 85% of "
-                                    f"the {container_limit_mb:.0f} MB container limit - saving "
-                                    f"an emergency checkpoint now")
-                        _save_checkpoint(epoch, is_epoch_complete=False)
-                        last_emergency_checkpoint_batch[0] = batch_count
-                
-                # Reset buffer
-                image_buffer = []
-                label_buffer = []
-        
-        # Process any remaining images (skip if we already hit target accuracy early)
-        if image_buffer and not (batch_count >= 3 and (100 * train_correct / train_total if train_total > 0 else 0) >= EARLY_STOP_ACC):
-            batch_imgs = torch.stack(image_buffer)
-            batch_labels = torch.tensor(label_buffer)
-            
-            batch_imgs = batch_imgs.to(DEVICE)
-            batch_labels = batch_labels.to(DEVICE)
-            
-            optimizer.zero_grad()
-            
-            pil_imgs = []
-            for i in range(batch_imgs.size(0)):
-                try:
-                    pil_img = transforms.ToPILImage()(batch_imgs[i].cpu())
-                    if pil_img.size[0] > 10 and pil_img.size[1] > 10:
-                        pil_imgs.append(pil_img)
-                except Exception:
-                    continue
-            
-            if pil_imgs:
-                try:
-                    features, logits = model.forward_batch(pil_imgs, grad=True)
-                    features = features.to(DEVICE)
-                    logits = logits.to(DEVICE)
-                    
-                    loss = criterion(logits, batch_labels[:len(pil_imgs)])
-                    loss.backward()
-                    optimizer.step()
-                    
-                    train_loss += loss.item() * batch_labels[:len(pil_imgs)].size(0)
-                    _, predicted = torch.max(logits, 1)
-                    train_total += batch_labels[:len(pil_imgs)].size(0)
-                    train_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-                    batch_count += 1
-                    
-                    # Same as the main loop: persist this last chunk's
-                    # results immediately rather than waiting for an
-                    # end-of-epoch save.
-                    store_chunk_features_to_db(features, batch_labels[:len(pil_imgs)],
-                                                dataset.idx_to_species, db)
-                    
-                except Exception:
-                    pass
-                
-                del batch_imgs
-                del batch_labels
-                del pil_imgs
-                gc.collect()
-                _trim_memory()
-                log_memory("leftover chunk")
-        
-        train_acc = 100 * train_correct / train_total if train_total > 0 else 0
-        
-        # Validation - a REAL held-out set now (see StreamingPokemonDataset:
-        # VAL_IMAGES_PER_SPECIES images per species are set aside during
-        # streaming and never yielded for training).
-        #
-        # BUG FIXED: this used to do `for img, label in dataset: ...` and
-        # take the first 50 items - but iterating `dataset` from scratch
-        # replays the SAME cached images in the SAME order every time,
-        # which is exactly what the training loop above had just trained
-        # on this epoch. Val Acc was measuring memorization of a training
-        # subset, not generalization - which made "best model" checkpoint
-        # selection and early stopping both unreliable.
-        model.eval()
-        val_correct = 0
-        val_total = 0
-        val_set = dataset.get_val_set()
-        
-        if val_set:
-            with torch.no_grad():
-                for i in range(0, len(val_set), STREAM_BATCH_SIZE):
-                    chunk = val_set[i:i + STREAM_BATCH_SIZE]
-                    batch_imgs = torch.stack([item[0] for item in chunk]).to(DEVICE)
-                    batch_labels = torch.tensor([item[1] for item in chunk]).to(DEVICE)
-                    
-                    pil_imgs = []
-                    for j in range(batch_imgs.size(0)):
-                        try:
-                            pil_img = transforms.ToPILImage()(batch_imgs[j].cpu())
-                            if pil_img.size[0] > 10 and pil_img.size[1] > 10:
-                                pil_imgs.append(pil_img)
-                        except Exception:
-                            continue
-                    
-                    if pil_imgs:
-                        _, logits = model.forward_batch(pil_imgs)
-                        _, predicted = torch.max(logits, 1)
-                        val_total += batch_labels[:len(pil_imgs)].size(0)
-                        val_correct += (predicted == batch_labels[:len(pil_imgs)]).sum().item()
-                    
-                    del batch_imgs, batch_labels, pil_imgs
-            gc.collect()
-            _trim_memory()
-        else:
-            log.info(f"   ℹ️ No held-out validation images yet (still on the "
-                     f"first streaming pass) - Val Acc will read 0% until it "
-                     f"finishes collecting")
-        
-        val_acc = 100 * val_correct / val_total if val_total > 0 else 0
-        
-        log.info(f"\n📊 Epoch {epoch+1} Results:")
-        log.info(f"   Train Acc: {train_acc:.1f}%")
-        log.info(f"   Val Acc: {val_acc:.1f}%")
-        log.info(f"   Total batches: {batch_count}")
-        
-        scheduler.step()
-        
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            epochs_without_improvement = 0
-            os.makedirs(os.path.dirname(MODEL_OUTPUT) or ".", exist_ok=True)
-            torch.save(model.feature_extractor.state_dict(), MODEL_OUTPUT)
-            log.info(f"   ✅ Saved model (val acc: {val_acc:.1f}%)")
-            # Write features to DB right away too — don't wait until the
-            # whole run finishes. If Railway crashes on a later epoch,
-            # this checkpoint's data is already safe in the DB.
-            store_features_to_db(model, dataset, db, label=f"epoch {epoch+1}, val acc {val_acc:.1f}%")
-        else:
-            epochs_without_improvement += 1
-
-        # Full training-state checkpoint at epoch end. Written to the DB
-        # (Turso), not local disk - see Database.save_checkpoint_blob.
-        _save_checkpoint(epoch, is_epoch_complete=True)
-
-        # Stop across epochs if we've hit the target or plateaued
-        if train_acc >= EARLY_STOP_ACC:
-            log.info(f"   🎯 Training accuracy target reached ({train_acc:.1f}% >= "
-                     f"{EARLY_STOP_ACC}%), stopping training")
-            stop_training = True
-        elif epochs_without_improvement >= EARLY_STOP_PATIENCE:
-            log.info(f"   ⏸️ Val accuracy hasn't improved in {EARLY_STOP_PATIENCE} "
-                     f"epochs (best: {best_val_acc:.1f}%), stopping early")
-            stop_training = True
-        
-        if stop_training:
-            break
-    
     log.info("-" * 60)
     log.info(f"✅ Training complete!")
-    log.info(f"   Best validation accuracy: {best_val_acc:.1f}%")
+    log.info(f"   Best validation retrieval accuracy: {best_acc:.1f}%")
     log.info(f"   Model saved to: {MODEL_OUTPUT}")
-    
+
     final_stats = db.get_stats()
     log.info(f"\n📊 Database Stats:")
     log.info(f"   Total species: {final_stats['total_species']}")
     log.info(f"   Total features: {final_stats['total_features']}")
     log.info(f"   Using Turso: {final_stats['use_turso']}")
-    
+
     log.info("\n" + "=" * 60)
     log.info("✅ All done! Model is ready to use.")
     log.info("=" * 60)
-    
+
     db.close()
 
 
