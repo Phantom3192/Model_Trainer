@@ -517,17 +517,6 @@ class Database:
         Stores the full training checkpoint (model + optimizer + scheduler
         state) in the training_metadata table, split into ~400KB chunks
         rather than one single row.
-
-        BUG FIXED: the previous version wrote the whole (multi-MB, base64-
-        encoded) checkpoint as ONE row. Turso's hosted service commonly
-        rejects or truncates large single-row writes - and the training
-        loop only ever caught that as a generic warning and moved on, so a
-        save could silently fail every single time with no clear signal in
-        the logs. That's the most likely explanation for "still crashed and
-        started from the beginning" even after checkpointing was added.
-        Splitting into small chunks avoids per-row size limits, and
-        reading the write back immediately (below) turns a silent failure
-        into a loud, specific one.
         """
         CHUNK_SIZE = 400_000  # raw bytes per chunk, before base64 (~533KB encoded)
         cursor = self._conn.cursor()
@@ -860,7 +849,7 @@ class StreamingPokemonDataset(IterableDataset):
     
     def _build_species_mapping(self):
         """Build species mapping from Hugging Face + local extras."""
-        
+
         # Get species from local extras
         local_species = set()
         extra_path = Path(self.extra_dir)
@@ -870,24 +859,24 @@ class StreamingPokemonDataset(IterableDataset):
                     species = folder.name.replace("_", " ").strip().lower()
                     if species:
                         local_species.add(species)
-        
+
         # Try to get species list from Hugging Face
         hf_species = set()
         try:
             from datasets import load_dataset
-            
-            with open(os.devnull, 'w') as devnull:
+
+            with open(os.devnull, "w") as devnull:
                 old_stdout = sys.stdout
                 old_stderr = sys.stderr
                 sys.stdout = devnull
                 sys.stderr = devnull
-                
+
                 try:
                     ds = load_dataset(DATASET_NAME, split="train", streaming=True)
                 finally:
                     sys.stdout = old_stdout
                     sys.stderr = old_stderr
-            
+
             # Detect label column
             features = ds.features
             label_col = None
@@ -895,7 +884,7 @@ class StreamingPokemonDataset(IterableDataset):
                 if col in features:
                     label_col = col
                     break
-            
+
             if label_col:
                 # Fast path: if this is a HF ClassLabel column, the full
                 # species list is already in the schema — no need to scan
@@ -925,23 +914,31 @@ class StreamingPokemonDataset(IterableDataset):
                             break
         except Exception as e:
             log.warning(f"Could not get species from Hugging Face: {e}")
-        
+
         # Combine species
         all_species = sorted(local_species | hf_species)
-        
+
         if not all_species:
             log.error("❌ No species found!")
             return
-        
+
         self.species_to_idx = {s: i for i, s in enumerate(all_species)}
         self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
-        
+
         # Limit species if needed
         if MAX_SPECIES > 0 and len(all_species) > MAX_SPECIES:
-            # Keep local species first, then add from HF
-            local_list = list(local_species)
-            hf_list = [s for s in all_species if s not in local_species]
-            selected = local_list + hf_list[:MAX_SPECIES - len(local_list)]
+            # Cap total species to MAX_SPECIES, prioritizing local ones
+            local_list = sorted(local_species)  # deterministic order
+            hf_list = sorted(s for s in all_species if s not in local_species)
+
+            # First take up to MAX_SPECIES local species
+            selected = local_list[:MAX_SPECIES]
+
+            # Then fill remaining slots from HF, if any
+            if len(selected) < MAX_SPECIES:
+                remaining = MAX_SPECIES - len(selected)
+                selected += hf_list[:remaining]
+
             self.species_to_idx = {s: i for i, s in enumerate(selected)}
             self.idx_to_species = {i: s for s, i in self.species_to_idx.items()}
             log.info(f"   Limited to {len(selected)} species (MAX_SPECIES={MAX_SPECIES})")
@@ -1248,6 +1245,7 @@ def _backbone_features(fe: "PokemonFeatureExtractor", batch_u8: torch.Tensor) ->
     return fe.backbone(x)
 
 
+@torch.no_grad()
 def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
                        total_hint: int = 0, tag: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -1357,7 +1355,7 @@ def train_head(model: "PokemonClassifier", Xtr, ytr, Xv, yv) -> float:
         for i in range(0, N, HEAD_BATCH):
             idx = perm[i:i + HEAD_BATCH]
             xb = F.dropout(Xtr[idx], p=HEAD_FEATURE_DROPOUT, training=True)
-            yb = ytr[idx]
+            yb = yb = ytr[idx]
             emb = F.normalize(fe.projection(xb), p=2, dim=1)
             logits = model.classifier(emb)
             loss = criterion(logits, yb)
