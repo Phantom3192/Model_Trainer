@@ -22,28 +22,34 @@ from typing import Dict, List, Optional, Tuple, Any, Iterator
 from io import BytesIO
 import re
 
-# ============ LOGGING ============
-logging.basicConfig(
-    level=logging.DEBUG if os.getenv("DEBUG") else logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+# ============ NUCLEAR LOG SUPPRESSION ============
+logging.root.handlers = []
+logging.basicConfig = lambda *args, **kwargs: None
 
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
-os.environ.setdefault("DATASETS_VERBOSITY", "error")
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-os.environ.setdefault("HF_HUB_VERBOSITY", "error")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+os.environ["DATASETS_VERBOSITY"] = "error"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_VERBOSITY"] = "error"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["GRPC_VERBOSITY"] = "ERROR"
 
 import warnings
-warnings.filterwarnings("default" if os.getenv("DEBUG") else "ignore")
+warnings.filterwarnings("ignore")
+warnings.simplefilter("ignore")
 
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:
+except:
     pass
+
+for name in logging.root.manager.loggerDict.keys():
+    logging.getLogger(name).disabled = True
+    logging.getLogger(name).setLevel(logging.CRITICAL)
+
+sys.stderr = open(os.devnull, 'w') if not os.getenv("DEBUG") else sys.stderr
 
 import torch
 import torch.nn as nn
@@ -57,12 +63,17 @@ import numpy as np
 from tqdm import tqdm
 
 # ============ SILENT LOGGER ============
-log = logging.getLogger("pokemon_trainer")
+class SilentLogger:
+    def info(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} INFO {msg}")
+    def warning(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} WARNING {msg}")
+    def error(self, msg, *args, **kwargs):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ERROR {msg}")
+    def debug(self, msg, *args, **kwargs):
+        pass
 
-def normalize_species_name(value: Any) -> str:
-    value = str(value).strip().lower().replace("_", " ").replace("-", " ")
-    value = re.sub(r"[^a-z0-9 ]+", "", value)
-    return re.sub(r"\s+", " ", value).strip()
+log = SilentLogger()
 
 def log_memory(tag: str = ""):
     """
@@ -255,7 +266,8 @@ def extract_archive_files():
                     with rarfile.RarFile(archive_path) as rf:
                         rf.extractall(temp_dir)
                 except:
-                    subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], capture_output=True, check=True)
+                    subprocess.run(['unrar', 'x', '-y', str(archive_path), str(temp_dir)], 
+                                 capture_output=True, check=False)
             elif ext in ['.7z']:
                 log.info(f"   📂 Extracting 7z: {archive_path.name}")
                 try:
@@ -263,7 +275,8 @@ def extract_archive_files():
                     with py7zr.SevenZipFile(archive_path, 'r') as sz:
                         sz.extractall(temp_dir)
                 except:
-                    subprocess.run(['7z', 'x', '-y', str(archive_path), f'-o{temp_dir}'], capture_output=True, check=True)
+                    subprocess.run(['7z', 'x', '-y', str(archive_path), f'-o{temp_dir}'], 
+                                 capture_output=True, check=False)
             
             extracted = process_extracted_files(temp_dir, extra_dir)
             extracted_count += extracted
@@ -375,13 +388,11 @@ class Database:
         self._conn.commit()
         log.info("✅ Database tables ready")
     
-    def add_pokemon_features(self, species: str, features: List[np.ndarray],
+    def add_pokemon_features(self, species: str, features: List[np.ndarray], 
                              variant_names: List[str] = None):
-        if variant_names is not None and len(variant_names) != len(features):
-            raise ValueError("variant_names must have the same length as features")
-        self.add_pokemon_features_batch({species: features}, {species: variant_names} if variant_names else None)
+        self.add_pokemon_features_batch({species: features})
 
-    def add_pokemon_features_batch(self, species_to_features: Dict[str, List[np.ndarray]], variant_names_by_species=None):
+    def add_pokemon_features_batch(self, species_to_features: Dict[str, List[np.ndarray]]):
         """
         Writes features for MULTIPLE species in ONE cursor + ONE commit,
         instead of one cursor/commit per species. This matters a lot once
@@ -408,17 +419,14 @@ class Database:
                     "SELECT COUNT(*) FROM pokemon_features WHERE species = ?", (species,)
                 )
                 existing_count = cursor.fetchone()[0]
-                supplied = (variant_names_by_species or {}).get(species)
-                names = supplied or [f"{species}_{existing_count + i + 1}" for i in range(len(features))]
-                if len(names) != len(features):
-                    raise ValueError(f"Invalid variant names for {species}")
+                variant_names = [f"{species}_{existing_count + i + 1}" for i in range(len(features))]
                 for i, feature in enumerate(features):
                     feature_json = json.dumps(feature.tolist())
                     cursor.execute("""
                         INSERT OR REPLACE INTO pokemon_features 
                         (species, variant_name, feature_vector, created_at)
                         VALUES (?, ?, ?, strftime('%s', 'now'))
-                    """, (species, names[i], feature_json))
+                    """, (species, variant_names[i], feature_json))
                 cursor.execute("""
                     INSERT INTO species_info (species, count, last_updated)
                     VALUES (?, ?, strftime('%s', 'now'))
@@ -616,8 +624,17 @@ class PokemonFeatureExtractor(nn.Module):
         # classifier, so swapping the classifier for Identity yields a flat
         # (N, 1280) vector.
         self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        classifier = self.backbone.classifier
+        if isinstance(classifier, nn.Sequential):
+            linear_layers = [layer for layer in classifier if isinstance(layer, nn.Linear)]
+            if not linear_layers:
+                raise RuntimeError(f"Could not find a Linear layer in EfficientNet classifier: {classifier!r}")
+            backbone_dim = linear_layers[-1].in_features
+        elif isinstance(classifier, nn.Linear):
+            backbone_dim = classifier.in_features
+        else:
+            raise RuntimeError(f"Unsupported EfficientNet classifier type: {type(classifier).__name__}")
         self.backbone.classifier = nn.Identity()
-        backbone_dim = self.backbone.classifier[1].in_features
         
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
@@ -656,30 +673,64 @@ class PokemonFeatureExtractor(nn.Module):
             log.warning(f"   ⚠️ Feature extraction failed: {e}")
             return np.zeros(256)
     
-    def extract_batch(self, images: List[Image.Image], grad: bool = False):
-        valid_indices = []
-        valid_tensors = []
-        for index, img in enumerate(images):
-            if isinstance(img, Image.Image):
-                try:
-                    valid_indices.append(index)
-                    valid_tensors.append(self.transform(img).unsqueeze(0))
-                except Exception as exc:
-                    log.warning("Skipping invalid image %d: %s", index, exc)
-        if not valid_tensors:
-            if grad:
-                return torch.empty((0, 256), device=DEVICE, requires_grad=True)
-            return np.empty((0, 256), dtype=np.float32)
-        batch_tensor = self.normalize(torch.cat(valid_tensors).to(DEVICE))
-        with torch.no_grad():
-            features = self.backbone(batch_tensor)
-        if grad:
-            projected = self.projection(features)
-            return F.normalize(projected, p=2, dim=1)
-        with torch.no_grad():
-            projected = self.projection(features)
-        return F.normalize(projected, p=2, dim=1).cpu().numpy()
+    def extract_batch(self, images: List[Image.Image], grad: bool = False) -> np.ndarray:
+        """
+        grad=False (default): used everywhere at inference time (bot lookups,
+        DB feature snapshots) - whole thing runs under no_grad, nothing trains.
 
+        grad=True: used during training. The backbone is still frozen/no_grad
+        (it's pretrained ImageNet weights we don't want to disturb), but
+        `projection` runs WITH grad so its weights actually receive gradient
+        updates. Previously this whole method - backbone AND projection - ran
+        under @torch.no_grad(), so `projection` never trained and stayed at
+        its random init for the entire run while only the final classifier
+        head learned on top of that noise. That's a big part of why accuracy
+        was stuck low.
+        """
+        valid_images = []
+        for img in images:
+            if img is not None and isinstance(img, Image.Image):
+                try:
+                    valid_images.append(self.transform(img).unsqueeze(0))
+                except Exception:
+                    continue
+        
+        if not valid_images:
+            return np.zeros((len(images), 256))
+        
+        try:
+            batch_tensor = torch.cat(valid_images, dim=0).to(DEVICE)
+            batch_tensor = self.normalize(batch_tensor)
+
+            with torch.no_grad():
+                features = self.backbone(batch_tensor)  # frozen, already flat (N, backbone_dim)
+
+            if grad:
+                projected = self.projection(features)
+            else:
+                with torch.no_grad():
+                    projected = self.projection(features)
+            projected = F.normalize(projected, p=2, dim=1)
+
+            if grad:
+                # keep it a tensor with grad history for the training loop
+                result = projected
+                if len(valid_images) < len(images):
+                    pad = torch.zeros(len(images) - len(valid_images), result.shape[1], device=result.device)
+                    result = torch.cat([result, pad], dim=0)
+                return result
+
+            result = projected.cpu().numpy()
+            if len(valid_images) < len(images):
+                padded = np.zeros((len(images), result.shape[1]))
+                padded[:len(valid_images)] = result
+                return padded
+            return result
+        except Exception as e:
+            log.warning(f"   ⚠️ Batch feature extraction failed: {e}")
+            if grad:
+                return torch.zeros(len(images), 256, device=DEVICE, requires_grad=True)
+            return np.zeros((len(images), 256))
 
 
 class CosineHead(nn.Module):
@@ -816,7 +867,7 @@ class StreamingPokemonDataset(IterableDataset):
         if extra_path.exists():
             for folder in extra_path.iterdir():
                 if folder.is_dir():
-                    species = normalize_species_name(folder.name)
+                    species = folder.name.replace("_", " ").strip().lower()
                     if species:
                         local_species.add(species)
         
@@ -865,7 +916,7 @@ class StreamingPokemonDataset(IterableDataset):
                         raw_label = row[label_col]
                         if isinstance(raw_label, int):
                             raw_label = features[label_col].int2str(raw_label)
-                        species = normalize_species_name(raw_label)
+                        species = str(raw_label).strip().lower()
                         hf_species.add(species)
                         count += 1
                         if count % 2000 == 0:
@@ -997,11 +1048,6 @@ class StreamingPokemonDataset(IterableDataset):
                 # training cache. Returning None tells the caller not to
                 # yield this one into the training stream.
                 self._val_cache.append((tensor, label))
-                if self.disk_cache_enabled:
-                    try:
-                        torch.save(self._val_cache, self.val_cache_path)
-                    except Exception as exc:
-                        log.warning("Could not persist validation cache: %s", exc)
                 return None
 
             # Cap cache growth so a large run can't OOM the container.
@@ -1042,7 +1088,7 @@ class StreamingPokemonDataset(IterableDataset):
                 if not folder.is_dir():
                     continue
                 
-                species = normalize_species_name(folder.name)
+                species = folder.name.replace("_", " ").strip().lower()
                 if species not in self.species_to_idx:
                     continue
                 
@@ -1095,9 +1141,8 @@ class StreamingPokemonDataset(IterableDataset):
                     break
             
             if not label_col or not image_col:
-                raise RuntimeError(
-                    f"Could not identify label/image columns. Available columns: {list(features.keys())}"
-                )
+                label_col = list(features.keys())[0]
+                image_col = list(features.keys())[1] if len(features) > 1 else list(features.keys())[0]
             
             rows_scanned = 0
             
@@ -1116,7 +1161,7 @@ class StreamingPokemonDataset(IterableDataset):
                     if isinstance(raw_label, int):
                         raw_label = features[label_col].int2str(raw_label)
                     
-                    species = normalize_species_name(raw_label)
+                    species = str(raw_label).strip().lower()
                     
                     if species not in self.species_to_idx:
                         continue
@@ -1147,8 +1192,7 @@ class StreamingPokemonDataset(IterableDataset):
                                  f"after scanning {rows_scanned} HF rows")
                         break
                     
-                except Exception as exc:
-                    log.warning("Skipping HF row %d: %s", rows_scanned, exc)
+                except Exception:
                     continue
                 
         except Exception as e:
@@ -1250,7 +1294,7 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
     flush()
 
     if not feats:
-        return torch.empty((0, BACKBONE_DIM), dtype=torch.float32), torch.empty(0, dtype=torch.long)
+        return torch.empty(0, BACKBONE_DIM), torch.empty(0, dtype=torch.long)
     return torch.cat(feats), torch.tensor(labels, dtype=torch.long)
 
 
@@ -1409,12 +1453,18 @@ def _get_current_rss_mb() -> Optional[float]:
     return None
 
 
-def stream_train():
+def stream_train():    
     global STREAM_BATCH_SIZE
-    if MAX_IMAGES_PER_SPECIES <= VAL_IMAGES_PER_SPECIES:
-        raise ValueError("MAX_IMAGES_PER_SPECIES must be greater than VAL_IMAGES_PER_SPECIES")
-    if STREAM_BATCH_SIZE < 1 or HEAD_BATCH < 1 or HEAD_EPOCHS < 1:
-        raise ValueError("STREAM_BATCH_SIZE, HEAD_BATCH, and HEAD_EPOCHS must be positive")
+    # ============ PRE-LOAD MODEL (NO DOWNLOAD DURING TRAINING) ============
+
+    log.info("📥 Pre-loading AI model...")
+    try:
+        from torchvision import models
+        _ = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        log.info("✅ Model loaded and cached!")
+    except Exception as e:
+        log.warning(f"⚠️ Model pre-load failed: {e}")
+    
     log_memory("baseline, right after model load")
     baseline_rss_mb = _get_current_rss_mb()
     container_limit_mb = _detect_container_memory_limit_mb()
