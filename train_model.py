@@ -610,20 +610,23 @@ class Database:
 
 # ============ AI MODEL ============
 
+BACKBONE_DIM = 1280  # EfficientNet-B0's pooled feature size
+
+
 class PokemonFeatureExtractor(nn.Module):
     def __init__(self, embedding_dim: int = 256):
         super().__init__()
-        # ShuffleNetV2 x0.5: fastest of the reasonable CPU-friendly options
-        # (1.4M params vs MobileNetV3-Small's 2.5M) - swapped in specifically
-        # for epoch speed now that the disk cache means epochs 2+ are
-        # compute-bound rather than network-bound. Trade-off: its features
-        # are somewhat weaker than MobileNetV3-Small's, which matters more
-        # than usual here given how little data there is per species (25
-        # images x 1119 classes) - worth watching train/val accuracy after
-        # this swap to confirm it's not costing more than the speed is worth.
-        self.backbone = models.shufflenet_v2_x0_5(weights=models.ShuffleNet_V2_X0_5_Weights.DEFAULT)
-        self.backbone.fc = nn.Identity()
-        backbone_dim = 1024  # ShuffleNetV2 x0.5's pre-fc feature dim
+        # EfficientNet-B0 (ImageNet ~77.7% top-1, 5.3M params). Much stronger
+        # features than the ShuffleNetV2 x0.5 it replaced (~60.6%), at ~10x the
+        # CPU cost per image - fine here because the backbone is frozen and
+        # embedded once per image (see build_feature_bank), and at inference
+        # it's still well under a second per image on CPU.
+        # torchvision's forward() does features -> avgpool -> flatten ->
+        # classifier, so swapping the classifier for Identity yields a flat
+        # (N, 1280) vector.
+        self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        self.backbone.classifier = nn.Identity()
+        backbone_dim = BACKBONE_DIM
         
         self.projection = nn.Sequential(
             nn.Linear(backbone_dim, embedding_dim),
@@ -1229,7 +1232,7 @@ class StreamingPokemonDataset(IterableDataset):
 @torch.no_grad()
 def _backbone_features(fe: "PokemonFeatureExtractor", batch_u8: torch.Tensor) -> torch.Tensor:
     """
-    uint8 (B,3,224,224) -> frozen ShuffleNet features (B,1024).
+    uint8 (B,3,224,224) -> frozen EfficientNet-B0 features (B,1280).
     Same math as PokemonFeatureExtractor.extract_batch (÷255 -> Normalize ->
     backbone), minus the pointless tensor->PIL->tensor round trip.
     """
@@ -1241,7 +1244,7 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
                        total_hint: int = 0, tag: str = "train") -> Tuple[torch.Tensor, torch.Tensor]:
     """
     One pass over `items` (any iterable of (uint8 image tensor, label)),
-    returning (features [N,1024], labels [N]).
+    returning (features [N,1280], labels [N]).
 
     The backbone is frozen and the cached images are already augmented, so
     its output for a given image never changes between epochs - computing it
@@ -1283,7 +1286,7 @@ def build_feature_bank(items, fe: "PokemonFeatureExtractor", batch_size: int,
     flush()
 
     if not feats:
-        return torch.empty(0, 1024), torch.empty(0, dtype=torch.long)
+        return torch.empty(0, BACKBONE_DIM), torch.empty(0, dtype=torch.long)
     return torch.cat(feats), torch.tensor(labels, dtype=torch.long)
 
 
@@ -1449,7 +1452,7 @@ def stream_train():
     log.info("📥 Pre-loading AI model...")
     try:
         from torchvision import models
-        _ = models.shufflenet_v2_x0_5(weights=models.ShuffleNet_V2_X0_5_Weights.DEFAULT)
+        _ = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
         log.info("✅ Model loaded and cached!")
     except Exception as e:
         log.warning(f"⚠️ Model pre-load failed: {e}")
@@ -1518,7 +1521,7 @@ def stream_train():
     log.info("\n🧠 Initializing model...")
     model = PokemonClassifier(num_species=num_species)
     model.to(DEVICE)
-    # The ShuffleNet backbone is FROZEN, so it must stay in eval() for the
+    # The EfficientNet backbone is FROZEN, so it must stay in eval() for the
     # whole run. The old code called feature_extractor.train(), which put the
     # backbone's BatchNorm layers in TRAIN mode: every (single-species)
     # batch was normalised with its own statistics and overwrote the
